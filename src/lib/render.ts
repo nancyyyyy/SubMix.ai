@@ -377,7 +377,14 @@ function runFfmpeg(inputPath: string, outputPath: string, filters: string[], var
       .videoFilters(filters)
       .videoCodec('libx264')
       .audioCodec('aac')
-      .outputOptions(['-preset veryfast', '-movflags +faststart'])
+      // Unconstrained, libx264 auto-detects thread count from the container's
+      // reported CPUs and gives each encoder thread its own frame-slice
+      // buffers for parallel motion estimation -- memory that scales with
+      // thread count regardless of how little RAM the container actually
+      // has. Capped here since this is what was OOM-killing (SIGKILL,
+      // confirmed via the exit diagnostics above) renders on Railway's 1GB
+      // plan.
+      .outputOptions(['-preset veryfast', '-movflags +faststart', '-threads 2'])
       .on('start', function (this: ffmpeg.FfmpegCommand, commandLine: string) {
         console.log(`[render:${variantName}] ffmpeg command: ${commandLine}`);
 

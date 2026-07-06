@@ -9,6 +9,7 @@ import { TranscriptSegment } from '@/lib/transcript';
 import { createProject, toCaptionSegments } from '@/lib/project';
 import { MAX_VIDEO_DURATION_SECONDS } from '@/lib/constants';
 import { checkRateLimit, getClientIp } from '@/lib/rate-limit';
+import { sweepStaleTempFiles } from '@/lib/cleanup';
 
 // ffmpeg transcoding + Replicate polling require Node, not the Edge runtime.
 export const runtime = 'nodejs';
@@ -271,6 +272,10 @@ export async function POST(request: NextRequest) {
       { status: 429, headers: { 'Retry-After': String(rateLimit.retryAfterSeconds) } }
     );
   }
+
+  // Stopgap disk-space guard in lieu of a separate cron process -- see
+  // lib/cleanup.ts. Runs piggybacked on this request and never blocks it.
+  await sweepStaleTempFiles();
 
   // Reject oversized uploads from the Content-Length header before buffering
   // the request body into memory — request.formData() below reads the whole

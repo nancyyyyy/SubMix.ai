@@ -2,12 +2,12 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createReadStream } from 'fs';
 import { stat } from 'fs/promises';
 import path from 'path';
+import { OUTPUT_DIR } from '@/lib/render';
 
 // /api/render writes rendered clips here; this route is the only way
 // the browser can fetch them back out as a downloadable URL.
 export const runtime = 'nodejs';
 
-const OUTPUT_DIR = path.join('/tmp', 'output');
 const FILENAME_REGEX = /^[a-f0-9-]+-(vertical|square|horizontal)\.mp4$/i;
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ filename: string }> }) {

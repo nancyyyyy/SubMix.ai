@@ -1,4 +1,5 @@
 import { promises as fs, existsSync } from 'fs';
+import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import ffmpeg from 'fluent-ffmpeg';
@@ -10,7 +11,7 @@ if (ffmpegStaticPath) {
   ffmpeg.setFfmpegPath(ffmpegStaticPath);
 }
 
-export const OUTPUT_DIR = path.join('/tmp', 'output');
+export const OUTPUT_DIR = path.join(os.tmpdir(), 'output');
 
 // ffmpeg-static ships no fonts and the host OS can't be relied on to have
 // any particular family installed, so the 4 curated caption fonts are

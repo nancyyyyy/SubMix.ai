@@ -1,4 +1,5 @@
 import { promises as fs } from 'fs';
+import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import type { TranscriptSegment } from './transcript';
@@ -93,7 +94,7 @@ export interface Project {
 
 // MVP persistence: one JSON file per project next to its source video.
 // Swap for a real database later without changing this module's API.
-const PROJECTS_DIR = path.join('/tmp', 'projects');
+export const PROJECTS_DIR = path.join(os.tmpdir(), 'projects');
 
 function projectDir(id: string): string {
   return path.join(PROJECTS_DIR, id);

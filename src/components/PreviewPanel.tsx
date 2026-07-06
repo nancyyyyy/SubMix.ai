@@ -24,10 +24,37 @@ function findActiveWordIndex(segment: CaptionSegment, time: number): number {
   return segment.words.findIndex((word) => time >= word.start && time <= word.end);
 }
 
+// Sample caption shown in the viewfinder before a video is uploaded, so the
+// frame never looks dead on first load. Loops on a fixed period independent
+// of any real video/segment timing.
+const DEMO_LOOP_SECONDS = 3.2;
+const DEMO_SEGMENT: CaptionSegment = {
+  start: 0,
+  end: 2.4,
+  words: [
+    { word: 'just', start: 0, end: 0.6 },
+    { word: 'say', start: 0.6, end: 1.2 },
+    { word: 'the', start: 1.2, end: 1.8 },
+    { word: 'word', start: 1.8, end: 2.4 },
+  ],
+};
+
 export function PreviewPanel({ style, videoFile, segments }: PreviewPanelProps) {
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
+  const [demoTime, setDemoTime] = useState(0);
   const videoRef = useRef<HTMLVideoElement>(null);
+
+  // Drives the demo caption loop only while there's no uploaded video;
+  // the interval is torn down as soon as a video arrives.
+  useEffect(() => {
+    if (videoFile) return;
+    const start = performance.now();
+    const id = setInterval(() => {
+      setDemoTime(((performance.now() - start) / 1000) % DEMO_LOOP_SECONDS);
+    }, 100);
+    return () => clearInterval(id);
+  }, [videoFile]);
 
   // Object URLs are only valid for the lifetime of the File reference that
   // created them, so a fresh one is minted per videoFile and revoked on
@@ -51,8 +78,14 @@ export function PreviewPanel({ style, videoFile, segments }: PreviewPanelProps) 
     style.outlineWidth > 0 ? { WebkitTextStroke: `${style.outlineWidth}px ${style.outlineColor}` } : {};
   const textShadow = style.shadowDepth > 0 ? `${style.shadowDepth}px ${style.shadowDepth}px 0 ${style.outlineColor}` : 'none';
 
-  const activeSegment = segments ? findActiveSegment(segments, currentTime) : null;
-  const activeWordIndex = activeSegment ? findActiveWordIndex(activeSegment, currentTime) : -1;
+  const activeSegment = videoUrl
+    ? segments
+      ? findActiveSegment(segments, currentTime)
+      : null
+    : DEMO_SEGMENT;
+  const activeWordIndex = activeSegment
+    ? findActiveWordIndex(activeSegment, videoUrl ? currentTime : demoTime)
+    : -1;
 
   return (
     <div className="flex flex-col gap-3">

@@ -3,7 +3,7 @@ import { createReadStream } from 'fs';
 import { stat } from 'fs/promises';
 import path from 'path';
 
-// generate-videos writes rendered clips here; this route is the only way
+// /api/render writes rendered clips here; this route is the only way
 // the browser can fetch them back out as a downloadable URL.
 export const runtime = 'nodejs';
 

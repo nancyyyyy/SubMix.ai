@@ -1,44 +1,53 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { promises as fs } from 'fs';
-import os from 'os';
 import path from 'path';
-import ytDlp from 'yt-dlp-exec';
+import {
+  ASPECT_RATIOS,
+  DEFAULT_STYLE,
+  FONT_CHOICES,
+  MAX_OUTLINE_WIDTH,
+  MAX_SHADOW_DEPTH,
+  MAX_SUBTITLE_SIZE,
+  MIN_OUTLINE_WIDTH,
+  MIN_SHADOW_DEPTH,
+  MIN_SUBTITLE_SIZE,
+  SUBTITLE_POSITIONS,
+  isHexColor,
+  type AspectRatio,
+  type FontChoice,
+  type StyleSettings,
+  type SubtitlePosition,
+} from '@/lib/project';
+import { getClientIp } from '@/lib/rate-limit';
 
-// Downloads the source video with yt-dlp and forwards to /api/transcribe and
-// /api/generate-videos over HTTP, so this needs Node, not the Edge runtime.
+// Thin backward-compatible orchestrator for the single-shot upload flow:
+// forwards the upload to /api/transcribe (Stage 1, persists a project), then
+// immediately to /api/render (Stage 2) with the submitted style. Kept only so
+// the existing one-shot UI keeps working; a caption-editing flow should call
+// /api/transcribe and /api/render directly instead of going through here.
 export const runtime = 'nodejs';
 export const maxDuration = 300;
 
-const YOUTUBE_URL_REGEX =
-  /^https?:\/\/(www\.|m\.)?(youtube\.com\/(watch\?v=|shorts\/|embed\/|live\/)[\w-]{11}|youtu\.be\/[\w-]{11})(\S*)?$/i;
+const MAX_FILE_SIZE_BYTES = 500 * 1024 * 1024;
+// multipart/form-data adds boundary markers and field headers on top of the
+// raw file bytes; this just keeps the Content-Length pre-check from
+// rejecting a file that's actually right at the limit.
+const MULTIPART_OVERHEAD_BYTES = 5 * 1024 * 1024;
+const MAX_DURATION_SECONDS = 10 * 60;
 
-const SUBTITLE_COLORS = ['white', 'yellow', 'neon'] as const;
-type SubtitleColor = (typeof SUBTITLE_COLORS)[number];
+const ALLOWED_EXTENSIONS = ['.mp4', '.mov', '.webm'];
+const EXTENSION_BY_MIME_TYPE: Record<string, string> = {
+  'video/mp4': '.mp4',
+  'video/quicktime': '.mov',
+  'video/webm': '.webm',
+};
 
-const ASPECT_RATIOS = ['9:16', '1:1', '16:9'] as const;
-type AspectRatio = (typeof ASPECT_RATIOS)[number];
+type Step = 'validation' | 'transcribe' | 'render';
 
-// generate-videos still speaks in variant names internally; this maps the
-// public aspect-ratio contract onto them.
-const RATIO_TO_VARIANT = {
-  '9:16': 'vertical',
-  '1:1': 'square',
-  '16:9': 'horizontal',
-} as const;
-type Variant = (typeof RATIO_TO_VARIANT)[AspectRatio];
-
-const MIN_SUBTITLE_SIZE = 20;
-const MAX_SUBTITLE_SIZE = 60;
-
-const VIDEO_DOWNLOAD_TIMEOUT_MS = 3 * 60 * 1000;
-
-type Step = 'validation' | 'transcribe' | 'download' | 'generate-videos';
-
-interface ProcessRequestBody {
-  url: string;
-  subtitleColor: SubtitleColor;
-  subtitleSize: number;
+interface ParsedRequest {
+  file: File;
+  style: StyleSettings;
   aspectRatios: AspectRatio[];
+  duration: number;
 }
 
 type Videos = Partial<Record<AspectRatio, string>>;
@@ -53,53 +62,143 @@ class ProcessError extends Error {
   }
 }
 
-function isValidYouTubeUrl(url: string): boolean {
-  return YOUTUBE_URL_REGEX.test(url.trim());
+function validateExtension(file: File): void {
+  const nameExt = path.extname(file.name).toLowerCase();
+  if (ALLOWED_EXTENSIONS.includes(nameExt) || EXTENSION_BY_MIME_TYPE[file.type]) return;
+
+  throw new ProcessError(
+    `Unsupported file type. Accepted formats: ${ALLOWED_EXTENSIONS.join(', ')}`,
+    'validation',
+    400
+  );
 }
 
-function parseBody(body: unknown): ProcessRequestBody {
-  const { url, subtitleColor, subtitleSize, aspectRatios } = (body ?? {}) as {
-    url?: unknown;
-    subtitleColor?: unknown;
-    subtitleSize?: unknown;
-    aspectRatios?: unknown;
-  };
+async function parseFormData(request: NextRequest): Promise<ParsedRequest> {
+  // Reject oversized uploads from the Content-Length header before buffering
+  // the request body into memory — request.formData() below reads the whole
+  // body up front, so without this an oversized file would already be fully
+  // received (and held in memory) by the time the later size check runs.
+  const contentLength = Number(request.headers.get('content-length'));
+  if (Number.isFinite(contentLength) && contentLength > MAX_FILE_SIZE_BYTES + MULTIPART_OVERHEAD_BYTES) {
+    throw new ProcessError(
+      `Video file exceeds the ${Math.round(MAX_FILE_SIZE_BYTES / (1024 * 1024))}MB limit`,
+      'validation',
+      413
+    );
+  }
 
-  if (typeof url !== 'string' || !isValidYouTubeUrl(url)) {
-    throw new ProcessError('A valid YouTube URL (youtube.com or youtu.be) is required', 'validation', 400);
+  let formData: FormData;
+  try {
+    formData = await request.formData();
+  } catch {
+    throw new ProcessError('Request body must be multipart/form-data', 'validation', 400);
   }
-  if (typeof subtitleColor !== 'string' || !SUBTITLE_COLORS.includes(subtitleColor as SubtitleColor)) {
-    throw new ProcessError(`subtitleColor must be one of: ${SUBTITLE_COLORS.join(', ')}`, 'validation', 400);
+
+  const file = formData.get('video');
+  if (!(file instanceof File) || file.size === 0) {
+    throw new ProcessError('A video file is required', 'validation', 400);
   }
-  if (
-    typeof subtitleSize !== 'number' ||
-    !Number.isFinite(subtitleSize) ||
-    subtitleSize < MIN_SUBTITLE_SIZE ||
-    subtitleSize > MAX_SUBTITLE_SIZE
-  ) {
+  validateExtension(file);
+
+  if (file.size > MAX_FILE_SIZE_BYTES) {
+    throw new ProcessError(
+      `Video file exceeds the ${Math.round(MAX_FILE_SIZE_BYTES / (1024 * 1024))}MB limit`,
+      'validation',
+      400
+    );
+  }
+
+  const color = formData.get('subtitleColor');
+  if (!isHexColor(color)) {
+    throw new ProcessError('subtitleColor must be a hex color like #ffffff', 'validation', 400);
+  }
+
+  const highlightColor = formData.get('highlightColor');
+  if (!isHexColor(highlightColor)) {
+    throw new ProcessError('highlightColor must be a hex color like #ffff00', 'validation', 400);
+  }
+
+  const outlineColor = formData.get('outlineColor');
+  if (!isHexColor(outlineColor)) {
+    throw new ProcessError('outlineColor must be a hex color like #000000', 'validation', 400);
+  }
+
+  const subtitleSize = Number(formData.get('subtitleSize'));
+  if (!Number.isFinite(subtitleSize) || subtitleSize < MIN_SUBTITLE_SIZE || subtitleSize > MAX_SUBTITLE_SIZE) {
     throw new ProcessError(
       `subtitleSize must be a number between ${MIN_SUBTITLE_SIZE} and ${MAX_SUBTITLE_SIZE}`,
       'validation',
       400
     );
   }
+
+  const outlineWidth = Number(formData.get('outlineWidth'));
+  if (!Number.isFinite(outlineWidth) || outlineWidth < MIN_OUTLINE_WIDTH || outlineWidth > MAX_OUTLINE_WIDTH) {
+    throw new ProcessError(
+      `outlineWidth must be a number between ${MIN_OUTLINE_WIDTH} and ${MAX_OUTLINE_WIDTH}`,
+      'validation',
+      400
+    );
+  }
+
+  const shadowDepth = Number(formData.get('shadowDepth'));
+  if (!Number.isFinite(shadowDepth) || shadowDepth < MIN_SHADOW_DEPTH || shadowDepth > MAX_SHADOW_DEPTH) {
+    throw new ProcessError(
+      `shadowDepth must be a number between ${MIN_SHADOW_DEPTH} and ${MAX_SHADOW_DEPTH}`,
+      'validation',
+      400
+    );
+  }
+
+  const position = formData.get('position');
+  if (typeof position !== 'string' || !SUBTITLE_POSITIONS.includes(position as SubtitlePosition)) {
+    throw new ProcessError(`position must be one of: ${SUBTITLE_POSITIONS.join(', ')}`, 'validation', 400);
+  }
+
+  const font = formData.get('font');
+  if (typeof font !== 'string' || !FONT_CHOICES.includes(font as FontChoice)) {
+    throw new ProcessError(`font must be one of: ${FONT_CHOICES.join(', ')}`, 'validation', 400);
+  }
+
+  const duration = Number(formData.get('duration'));
+  if (!Number.isFinite(duration) || duration <= 0) {
+    throw new ProcessError('duration is required and must be a positive number of seconds', 'validation', 400);
+  }
+  if (duration > MAX_DURATION_SECONDS) {
+    throw new ProcessError(
+      `Video exceeds the ${Math.round(MAX_DURATION_SECONDS / 60)}-minute limit`,
+      'validation',
+      400
+    );
+  }
+
+  const aspectRatios = formData.getAll('aspectRatios');
   if (
-    !Array.isArray(aspectRatios) ||
     aspectRatios.length === 0 ||
-    !aspectRatios.every((r): r is AspectRatio => typeof r === 'string' && ASPECT_RATIOS.includes(r as AspectRatio))
+    !aspectRatios.every((r): r is string => typeof r === 'string' && ASPECT_RATIOS.includes(r as AspectRatio))
   ) {
     throw new ProcessError(
-      `aspectRatios must be a non-empty array of: ${ASPECT_RATIOS.join(', ')}`,
+      `aspectRatios must include at least one of: ${ASPECT_RATIOS.join(', ')}`,
       'validation',
       400
     );
   }
 
   return {
-    url: url.trim(),
-    subtitleColor: subtitleColor as SubtitleColor,
-    subtitleSize,
-    aspectRatios: Array.from(new Set(aspectRatios)),
+    file,
+    style: {
+      color,
+      highlightColor,
+      size: subtitleSize,
+      position: position as SubtitlePosition,
+      animation: DEFAULT_STYLE.animation,
+      outlineWidth,
+      shadowDepth,
+      outlineColor,
+      font: font as FontChoice,
+    },
+    aspectRatios: Array.from(new Set(aspectRatios as AspectRatio[])),
+    duration,
   };
 }
 
@@ -111,13 +210,16 @@ async function safeJson(res: Response): Promise<Record<string, unknown> | null> 
   }
 }
 
-async function transcribe(origin: string, url: string): Promise<{ srt: string; duration: number }> {
+async function transcribe(origin: string, file: File, clientIp: string): Promise<{ projectId: string }> {
+  const formData = new FormData();
+  formData.append('video', file);
+
   let res: Response;
   try {
     res = await fetch(`${origin}/api/transcribe`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url }),
+      headers: { 'x-forwarded-for': clientIp },
+      body: formData,
     });
   } catch (err) {
     throw new ProcessError(
@@ -128,127 +230,67 @@ async function transcribe(origin: string, url: string): Promise<{ srt: string; d
   }
 
   const data = await safeJson(res);
-  if (!res.ok || !data || data.status !== 'success') {
+  if (!res.ok || !data || data.status !== 'success' || typeof data.projectId !== 'string') {
     const message = (data?.error as string | undefined) ?? `Transcription failed (${res.status})`;
     throw new ProcessError(message, 'transcribe', res.status >= 400 ? res.status : 502);
   }
 
-  const { srt, duration } = data as { srt?: unknown; duration?: unknown };
-  if (typeof srt !== 'string' || srt.trim().length === 0 || typeof duration !== 'number') {
-    throw new ProcessError('Transcription service returned an unexpected response', 'transcribe', 502);
-  }
-
-  return { srt, duration };
+  return { projectId: data.projectId };
 }
 
-// /api/generate-videos operates on a local file path, but /api/transcribe only
-// keeps the extracted audio (and cleans it up), so the source video is
-// downloaded again here for the styling/render step.
-async function downloadSourceVideo(url: string, tempDir: string): Promise<string> {
-  const outputTemplate = path.join(tempDir, 'source.%(ext)s');
-  try {
-    await ytDlp(
-      url,
-      {
-        format: 'mp4/bestvideo+bestaudio',
-        mergeOutputFormat: 'mp4',
-        output: outputTemplate,
-        noPlaylist: true,
-        noWarnings: true,
-      },
-      { timeout: VIDEO_DOWNLOAD_TIMEOUT_MS }
-    );
-  } catch (err) {
-    throw new ProcessError(
-      `Failed to download source video: ${err instanceof Error ? err.message : String(err)}`,
-      'download',
-      502
-    );
-  }
-
-  const videoPath = path.join(tempDir, 'source.mp4');
-  try {
-    await fs.access(videoPath);
-  } catch {
-    throw new ProcessError('yt-dlp did not produce a video file', 'download', 502);
-  }
-  return videoPath;
-}
-
-async function generateVideos(
+async function render(
   origin: string,
-  videoPath: string,
-  srt: string,
-  subtitleColor: SubtitleColor,
-  subtitleSize: number,
-  aspectRatios: AspectRatio[]
+  projectId: string,
+  style: StyleSettings,
+  aspectRatios: AspectRatio[],
+  clientIp: string
 ): Promise<Videos> {
-  const variants = aspectRatios.map((r) => RATIO_TO_VARIANT[r]);
-
   let res: Response;
   try {
-    res = await fetch(`${origin}/api/generate-videos`, {
+    res = await fetch(`${origin}/api/render`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ videoPath, srt, subtitleColor, subtitleSize, aspectRatios }),
+      headers: { 'Content-Type': 'application/json', 'x-forwarded-for': clientIp },
+      body: JSON.stringify({ projectId, style, aspectRatios }),
     });
   } catch (err) {
     throw new ProcessError(
-      `Could not reach the video generation service: ${err instanceof Error ? err.message : String(err)}`,
-      'generate-videos',
+      `Could not reach the rendering service: ${err instanceof Error ? err.message : String(err)}`,
+      'render',
       502
     );
   }
 
   const data = await safeJson(res);
   if (!res.ok || !data || data.status !== 'success') {
-    const message = (data?.error as string | undefined) ?? `Video generation failed (${res.status})`;
-    throw new ProcessError(message, 'generate-videos', res.status >= 400 ? res.status : 502);
+    const message = (data?.error as string | undefined) ?? `Rendering failed (${res.status})`;
+    throw new ProcessError(message, 'render', res.status >= 400 ? res.status : 502);
   }
 
-  const variantVideos = (data as { videos?: unknown }).videos as
-    | Partial<Record<Variant, unknown>>
-    | undefined;
-
-  if (!variantVideos || !variants.every((v) => typeof variantVideos[v] === 'string')) {
-    throw new ProcessError('Video generation service returned an unexpected response', 'generate-videos', 502);
+  const videos = (data as { videos?: unknown }).videos as Videos | undefined;
+  if (!videos || !aspectRatios.every((r) => typeof videos[r] === 'string')) {
+    throw new ProcessError('Rendering service returned an unexpected response', 'render', 502);
   }
 
-  const videos: Videos = {};
-  for (const ratio of aspectRatios) {
-    videos[ratio] = variantVideos[RATIO_TO_VARIANT[ratio]] as string;
-  }
   return videos;
 }
 
 export async function POST(request: NextRequest) {
-  let body: unknown;
+  let parsed: ParsedRequest;
   try {
-    body = await request.json();
-  } catch {
-    return NextResponse.json({ status: 'error', error: 'Request body must be valid JSON' }, { status: 400 });
-  }
-
-  let parsed: ProcessRequestBody;
-  try {
-    parsed = parseBody(body);
+    parsed = await parseFormData(request);
   } catch (err) {
     const statusCode = err instanceof ProcessError ? err.statusCode : 400;
     const message = err instanceof Error ? err.message : 'Invalid request';
     return NextResponse.json({ status: 'error', error: message }, { status: statusCode });
   }
 
-  const { url, subtitleColor, subtitleSize, aspectRatios } = parsed;
+  const { file, style, aspectRatios, duration } = parsed;
   const origin = request.nextUrl.origin;
+  const clientIp = getClientIp(request);
 
-  let tempDir: string | null = null;
   try {
-    const { srt, duration } = await transcribe(origin, url);
-
-    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'process-'));
-    const videoPath = await downloadSourceVideo(url, tempDir);
-
-    const videos = await generateVideos(origin, videoPath, srt, subtitleColor, subtitleSize, aspectRatios);
+    const { projectId } = await transcribe(origin, file, clientIp);
+    const videos = await render(origin, projectId, style, aspectRatios, clientIp);
 
     return NextResponse.json({ status: 'success', videos, duration });
   } catch (err) {
@@ -256,9 +298,5 @@ export async function POST(request: NextRequest) {
     const step = err instanceof ProcessError ? err.step : 'unknown';
     const message = err instanceof Error ? err.message : 'Unknown error';
     return NextResponse.json({ status: 'error', step, error: message }, { status: statusCode });
-  } finally {
-    if (tempDir) {
-      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
-    }
   }
 }

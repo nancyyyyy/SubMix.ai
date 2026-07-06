@@ -1,31 +1,32 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { promises as fs, createWriteStream } from 'fs';
+import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
-import ytdl from 'ytdl-core';
 import ffmpeg from 'fluent-ffmpeg';
 import ffmpegStaticPath from 'ffmpeg-static';
+import ffprobeStatic from 'ffprobe-static';
+import { TranscriptSegment } from '@/lib/transcript';
+import { createProject, toCaptionSegments } from '@/lib/project';
+import { MAX_VIDEO_DURATION_SECONDS } from '@/lib/constants';
+import { checkRateLimit, getClientIp } from '@/lib/rate-limit';
 
-// ytdl-core streams + ffmpeg transcoding require Node, not the Edge runtime.
+// ffmpeg transcoding + Replicate polling require Node, not the Edge runtime.
 export const runtime = 'nodejs';
 export const maxDuration = 300;
 
 if (ffmpegStaticPath) {
   ffmpeg.setFfmpegPath(ffmpegStaticPath);
 }
-
-const YOUTUBE_URL_REGEX =
-  /^https?:\/\/(www\.|m\.)?(youtube\.com\/(watch\?v=|shorts\/|embed\/|live\/)[\w-]{11}|youtu\.be\/[\w-]{11})(\S*)?$/i;
+if (ffprobeStatic.path) {
+  ffmpeg.setFfprobePath(ffprobeStatic.path);
+}
 
 const REPLICATE_API_BASE = 'https://api.replicate.com/v1';
-// Referencing the model by name (rather than a pinned version hash) always
-// resolves to the latest version, so this doesn't go stale as Replicate
-// publishes new versions of the model.
-const REPLICATE_MODEL = process.env.REPLICATE_WHISPER_MODEL ?? 'openai/whisper';
+const REPLICATE_WHISPER_VERSION =
+  process.env.REPLICATE_WHISPER_VERSION ?? '744c4f2bffae674f82e79ed46f9cc54796d4903b3e20e68353e05a93eb10a55c';
 
 const POLL_INTERVAL_MS = 3000;
 const POLL_TIMEOUT_MS = 10 * 60 * 1000;
-const DOWNLOAD_TIMEOUT_MS = 3 * 60 * 1000;
 
 interface ReplicatePrediction {
   id: string;
@@ -43,10 +44,6 @@ class TranscribeError extends Error {
   }
 }
 
-function isValidYouTubeUrl(url: string): boolean {
-  return YOUTUBE_URL_REGEX.test(url.trim());
-}
-
 async function safeText(res: Response): Promise<string> {
   try {
     return await res.text();
@@ -55,74 +52,33 @@ async function safeText(res: Response): Promise<string> {
   }
 }
 
-async function fetchVideoInfo(url: string): Promise<ytdl.videoInfo> {
-  try {
-    return await ytdl.getInfo(url);
-  } catch (err) {
-    throw new TranscribeError(
-      `Could not read video metadata (is the URL valid and public?): ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-      422
-    );
-  }
-}
-
-function getVideoDuration(info: ytdl.videoInfo): number {
-  const seconds = Number(info.videoDetails.lengthSeconds);
-  return Number.isFinite(seconds) ? seconds : 0;
-}
-
-async function downloadRawAudio(info: ytdl.videoInfo, tempDir: string): Promise<string> {
-  let format: ytdl.videoFormat;
-  try {
-    format = ytdl.chooseFormat(info.formats, { filter: 'audioonly', quality: 'highestaudio' });
-  } catch (err) {
-    throw new TranscribeError(
-      `No downloadable audio stream was found for this video: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-      422
-    );
-  }
-
-  const rawPath = path.join(tempDir, `audio-raw.${format.container || 'webm'}`);
-
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const stream = ytdl.downloadFromInfo(info, { format });
-      const fileStream = createWriteStream(rawPath);
-      const timer = setTimeout(() => stream.destroy(new Error('Download timed out')), DOWNLOAD_TIMEOUT_MS);
-
-      const fail = (err: Error) => {
-        clearTimeout(timer);
-        fileStream.destroy();
-        reject(err);
-      };
-
-      stream.on('error', fail);
-      fileStream.on('error', fail);
-      fileStream.on('finish', () => {
-        clearTimeout(timer);
-        resolve();
-      });
-      stream.pipe(fileStream);
+async function probeDurationSeconds(videoPath: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(videoPath, (err, metadata) => {
+      if (err) {
+        reject(
+          new TranscribeError(
+            `Failed to read video metadata with ffprobe: ${err instanceof Error ? err.message : String(err)}`,
+            400
+          )
+        );
+        return;
+      }
+      const duration = metadata.format?.duration;
+      if (typeof duration !== 'number' || !Number.isFinite(duration)) {
+        reject(new TranscribeError('Could not determine video duration', 400));
+        return;
+      }
+      resolve(duration);
     });
-  } catch (err) {
-    throw new TranscribeError(
-      `Failed to download audio stream: ${err instanceof Error ? err.message : String(err)}`,
-      502
-    );
-  }
-
-  return rawPath;
+  });
 }
 
-async function extractWav(rawPath: string, tempDir: string): Promise<string> {
+async function extractAudio(videoPath: string, tempDir: string): Promise<string> {
   const wavPath = path.join(tempDir, 'audio.wav');
   try {
     await new Promise<void>((resolve, reject) => {
-      ffmpeg(rawPath)
+      ffmpeg(videoPath)
         .noVideo()
         .audioCodec('pcm_s16le')
         .audioChannels(1)
@@ -175,7 +131,7 @@ async function uploadAudioToReplicate(filePath: string, token: string): Promise<
 async function createPrediction(audioUrl: string, token: string): Promise<ReplicatePrediction> {
   let res: Response;
   try {
-    res = await fetch(`${REPLICATE_API_BASE}/models/${REPLICATE_MODEL}/predictions`, {
+    res = await fetch(`${REPLICATE_API_BASE}/predictions`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
@@ -183,9 +139,10 @@ async function createPrediction(audioUrl: string, token: string): Promise<Replic
         Prefer: 'wait',
       },
       body: JSON.stringify({
+        version: REPLICATE_WHISPER_VERSION,
         input: {
-          audio: audioUrl,
-          transcription: 'srt',
+          file_url: audioUrl,
+          language: 'en',
           translate: false,
         },
       }),
@@ -233,24 +190,100 @@ async function pollPrediction(prediction: ReplicatePrediction, token: string): P
   return current;
 }
 
-// The exact output field name varies across whisper model versions/forks
-// on Replicate, so check a few of the common ones defensively.
-function extractSrt(output: unknown): string {
-  if (typeof output === 'string') {
-    return output;
+// thomasmol/whisper-diarization attaches a "words" array (word/start/end,
+// plus speaker/probability we ignore) to every entry in "segments". If a
+// future model swap omits "words", fail loudly instead of silently falling
+// back to line-level-only timing.
+function extractSegments(output: unknown): TranscriptSegment[] {
+  const candidate = output as Record<string, unknown> | null;
+  const rawSegments = candidate && typeof candidate === 'object' ? candidate.segments : undefined;
+
+  if (!Array.isArray(rawSegments)) {
+    throw new TranscribeError('Whisper response did not include a "segments" array', 502);
   }
-  if (output && typeof output === 'object') {
-    const candidate = output as Record<string, unknown>;
-    for (const key of ['srt', 'transcription', 'subtitles']) {
-      if (typeof candidate[key] === 'string') {
-        return candidate[key] as string;
-      }
+
+  const segments: TranscriptSegment[] = [];
+
+  for (const raw of rawSegments) {
+    const seg = raw as Record<string, unknown>;
+    const text = typeof seg.text === 'string' ? seg.text.trim() : '';
+    if (!text) continue;
+
+    const rawWords = seg.words;
+    if (!Array.isArray(rawWords) || rawWords.length === 0) {
+      throw new TranscribeError(
+        'Whisper segments did not include word-level timestamps. The configured Replicate model/version does ' +
+          'not return a "words" array per segment.',
+        502
+      );
     }
+
+    const words = rawWords.map((w) => {
+      const word = w as Record<string, unknown>;
+      return {
+        word: String(word.word ?? '').trim(),
+        start: Number(word.start),
+        end: Number(word.end),
+      };
+    });
+
+    segments.push({
+      start: Number(seg.start),
+      end: Number(seg.end),
+      text,
+      words,
+    });
   }
-  throw new TranscribeError('Whisper response did not include SRT output', 502);
+
+  if (segments.length === 0) {
+    throw new TranscribeError('Whisper response did not include any transcribed segments', 502);
+  }
+
+  return segments;
 }
 
+const EXTENSION_BY_MIME_TYPE: Record<string, string> = {
+  'video/mp4': '.mp4',
+  'video/quicktime': '.mov',
+  'video/webm': '.webm',
+};
+const ALLOWED_EXTENSIONS = ['.mp4', '.mov', '.webm'];
+const MAX_FILE_SIZE_BYTES = 500 * 1024 * 1024;
+// multipart/form-data adds boundary markers and field headers on top of the
+// raw file bytes; this just keeps the Content-Length pre-check from
+// rejecting a file that's actually right at the limit.
+const MULTIPART_OVERHEAD_BYTES = 5 * 1024 * 1024;
+
+function resolveExtension(file: File): string | null {
+  const nameExt = path.extname(file.name).toLowerCase();
+  if (ALLOWED_EXTENSIONS.includes(nameExt)) return nameExt;
+  return EXTENSION_BY_MIME_TYPE[file.type] ?? null;
+}
+
+// Stage 1 only: transcribes the upload and persists it as a project (video +
+// word-level caption JSON). It never burns captions into video — that's
+// Stage 2, triggered separately and repeatably via /api/render.
 export async function POST(request: NextRequest) {
+  const rateLimit = checkRateLimit(`transcribe:${getClientIp(request)}`);
+  if (!rateLimit.allowed) {
+    return NextResponse.json(
+      { status: 'error', error: 'Too many requests, please try again later' },
+      { status: 429, headers: { 'Retry-After': String(rateLimit.retryAfterSeconds) } }
+    );
+  }
+
+  // Reject oversized uploads from the Content-Length header before buffering
+  // the request body into memory — request.formData() below reads the whole
+  // body up front, so without this an oversized file would already be fully
+  // received (and held in memory) by the time the later size check runs.
+  const contentLength = Number(request.headers.get('content-length'));
+  if (Number.isFinite(contentLength) && contentLength > MAX_FILE_SIZE_BYTES + MULTIPART_OVERHEAD_BYTES) {
+    return NextResponse.json(
+      { status: 'error', error: `Video file exceeds the ${Math.round(MAX_FILE_SIZE_BYTES / (1024 * 1024))}MB limit` },
+      { status: 413 }
+    );
+  }
+
   const replicateToken = process.env.REPLICATE_API_TOKEN;
   if (!replicateToken) {
     return NextResponse.json(
@@ -259,17 +292,27 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  let body: unknown;
+  let formData: FormData;
   try {
-    body = await request.json();
+    formData = await request.formData();
   } catch {
-    return NextResponse.json({ status: 'error', error: 'Request body must be valid JSON' }, { status: 400 });
+    return NextResponse.json({ status: 'error', error: 'Request body must be multipart/form-data' }, { status: 400 });
   }
 
-  const url = (body as { url?: unknown })?.url;
-  if (typeof url !== 'string' || !isValidYouTubeUrl(url)) {
+  const file = formData.get('video');
+  if (!(file instanceof File) || file.size === 0) {
+    return NextResponse.json({ status: 'error', error: 'A video file is required' }, { status: 400 });
+  }
+  if (file.size > MAX_FILE_SIZE_BYTES) {
     return NextResponse.json(
-      { status: 'error', error: 'A valid YouTube URL (youtube.com or youtu.be) is required' },
+      { status: 'error', error: `Video file exceeds the ${Math.round(MAX_FILE_SIZE_BYTES / (1024 * 1024))}MB limit` },
+      { status: 400 }
+    );
+  }
+  const extension = resolveExtension(file);
+  if (!extension) {
+    return NextResponse.json(
+      { status: 'error', error: `Unsupported file type. Accepted formats: ${ALLOWED_EXTENSIONS.join(', ')}` },
       { status: 400 }
     );
   }
@@ -277,22 +320,36 @@ export async function POST(request: NextRequest) {
   let tempDir: string | null = null;
   try {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'transcribe-'));
+    const videoBuffer = Buffer.from(await file.arrayBuffer());
+    const videoPath = path.join(tempDir, `source${extension}`);
+    await fs.writeFile(videoPath, videoBuffer);
 
-    const info = await fetchVideoInfo(url);
-    const duration = getVideoDuration(info);
-    const rawPath = await downloadRawAudio(info, tempDir);
-    const wavPath = await extractWav(rawPath, tempDir);
+    const durationSeconds = await probeDurationSeconds(videoPath);
+    if (durationSeconds > MAX_VIDEO_DURATION_SECONDS) {
+      throw new TranscribeError(
+        `Video exceeds the ${Math.round(MAX_VIDEO_DURATION_SECONDS / 60)}-minute limit`,
+        400
+      );
+    }
+
+    const wavPath = await extractAudio(videoPath, tempDir);
 
     const audioUrl = await uploadAudioToReplicate(wavPath, replicateToken);
     const created = await createPrediction(audioUrl, replicateToken);
     const finished = await pollPrediction(created, replicateToken);
-    const srt = extractSrt(finished.output);
+    const segments = extractSegments(finished.output);
 
-    return NextResponse.json({ srt, duration, status: 'success' });
+    const project = await createProject({
+      videoBuffer,
+      videoExtension: extension,
+      segments: toCaptionSegments(segments),
+    });
+
+    return NextResponse.json({ status: 'success', projectId: project.id, project });
   } catch (err) {
     const statusCode = err instanceof TranscribeError ? err.statusCode : 500;
     const message = err instanceof Error ? err.message : 'Unknown error';
-    return NextResponse.json({ srt: '', duration: 0, status: 'error', error: message }, { status: statusCode });
+    return NextResponse.json({ status: 'error', error: message }, { status: statusCode });
   } finally {
     if (tempDir) {
       await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});

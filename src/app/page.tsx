@@ -1,45 +1,138 @@
 'use client';
 
 import { useState } from 'react';
+import { SiteHeader } from '@/components/SiteHeader';
+import { FeatureHighlights } from '@/components/FeatureHighlights';
+import { UploadZone } from '@/components/UploadZone';
+import { CaptionEditor } from '@/components/CaptionEditor';
+import { CaptionStyleSection } from '@/components/CaptionStyleSection';
+import { FormatsSection } from '@/components/FormatsSection';
+import { PreviewPanel } from '@/components/PreviewPanel';
+import { GenerateAction } from '@/components/GenerateAction';
+import { ResultsGrid } from '@/components/ResultsGrid';
+import {
+  DEFAULT_CAPTION_STYLE,
+  PANEL,
+  RATIOS,
+  RENDER_STEPS,
+  SECTION_LABEL,
+  TRANSCRIBE_STEPS,
+  type RatioKey,
+  type Stage,
+  type Videos,
+} from '@/lib/constants';
+import type { CaptionSegment, Project, StyleSettings } from '@/lib/project';
 
-const SUBTITLE_COLORS = ['white', 'yellow', 'neon'] as const;
-type SubtitleColor = (typeof SUBTITLE_COLORS)[number];
+type View = 'edit' | 'results';
 
-const MIN_SUBTITLE_SIZE = 20;
-const MAX_SUBTITLE_SIZE = 60;
+// Isolated results screen shown in place of the whole editing UI once a
+// render completes — "Go back and edit" only flips the parent's view state,
+// it never touches project/videos/style, so nothing is lost switching back.
+function ResultsView({ videos, onBack }: { videos: Videos; onBack: () => void }) {
+  return (
+    <div className="mx-auto max-w-3xl">
+      <button
+        type="button"
+        onClick={onBack}
+        className="mb-10 font-mono text-xs uppercase tracking-wide text-green underline decoration-dotted underline-offset-2 transition-colors hover:text-green/80"
+      >
+        ← Go back and edit
+      </button>
 
-const RATIOS = [
-  { key: '9:16', label: 'Vertical (9:16)', sublabel: 'TikTok/Reels/Shorts' },
-  { key: '1:1', label: 'Square (1:1)', sublabel: 'Instagram Feed' },
-  { key: '16:9', label: 'Horizontal (16:9)', sublabel: 'YouTube/LinkedIn' },
-] as const;
-type RatioKey = (typeof RATIOS)[number]['key'];
+      <div className="mb-10 text-center">
+        <h1 className="font-display text-4xl font-bold uppercase tracking-tight text-primary">
+          Your videos are ready
+        </h1>
+        <p className="mt-3 text-muted">Download your captioned clips below</p>
+      </div>
 
-type Stage = 'idle' | 'downloading' | 'transcribing' | 'generating' | 'done' | 'error';
+      <ResultsGrid videos={videos} />
+    </div>
+  );
+}
 
-type Videos = Partial<Record<RatioKey, string>>;
+interface TranscribeResponse {
+  status: 'success' | 'error';
+  projectId?: string;
+  project?: Project;
+  error?: string;
+}
 
-const STAGE_LABELS: Record<Stage, string> = {
-  idle: '',
-  downloading: 'Downloading…',
-  transcribing: 'Transcribing…',
-  generating: 'Generating…',
-  done: '',
-  error: '',
-};
+interface RenderResponse {
+  status: 'success' | 'error';
+  videos?: Videos;
+  error?: string;
+}
+
+// Tracks the actual network upload via XHR progress events, then hands off to
+// onUploadComplete once the request body has fully left the browser — the
+// server's own transcription time has no progress signal, so the caller
+// falls back to a plain "transcribing" state for that part.
+function uploadAndTranscribe(
+  formData: FormData,
+  onProgress: (percent: number) => void,
+  onUploadComplete: () => void
+): Promise<TranscribeResponse> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/transcribe');
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
+    };
+    xhr.upload.onload = () => {
+      onProgress(100);
+      onUploadComplete();
+    };
+
+    xhr.onload = () => {
+      try {
+        resolve(JSON.parse(xhr.responseText) as TranscribeResponse);
+      } catch {
+        reject(new Error('Server returned an invalid response'));
+      }
+    };
+    xhr.onerror = () => reject(new Error('Network error while uploading video'));
+
+    xhr.send(formData);
+  });
+}
 
 export default function Home() {
-  const [url, setUrl] = useState('');
-  const [subtitleColor, setSubtitleColor] = useState<SubtitleColor>('white');
-  const [subtitleSize, setSubtitleSize] = useState(40);
+  const [videoFile, setVideoFile] = useState<File | null>(null);
+  const [videoDuration, setVideoDuration] = useState<number | null>(null);
+  const [fileError, setFileError] = useState<string | null>(null);
+  const [uploadProgress, setUploadProgress] = useState(0);
+
+  const [style, setStyle] = useState<StyleSettings>(DEFAULT_CAPTION_STYLE);
   const [selectedRatios, setSelectedRatios] = useState<Set<RatioKey>>(
     () => new Set(RATIOS.map((r) => r.key))
   );
   const [stage, setStage] = useState<Stage>('idle');
   const [error, setError] = useState<string | null>(null);
   const [videos, setVideos] = useState<Videos | null>(null);
+  const [view, setView] = useState<View>('edit');
 
-  const isLoading = stage === 'downloading' || stage === 'transcribing' || stage === 'generating';
+  const [projectId, setProjectId] = useState<string | null>(null);
+  const [segments, setSegments] = useState<CaptionSegment[] | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  const isLoading = stage === 'uploading' || stage === 'transcribing' || stage === 'rendering';
+
+  function updateStyle(patch: Partial<StyleSettings>) {
+    setStyle((prev) => ({ ...prev, ...patch }));
+  }
+
+  function resetUpload() {
+    setVideoFile(null);
+    setVideoDuration(null);
+    setFileError(null);
+    setProjectId(null);
+    setSegments(null);
+    setVideos(null);
+    setStage('idle');
+    setView('edit');
+  }
 
   function toggleRatio(key: RatioKey) {
     setSelectedRatios((prev) => {
@@ -53,30 +146,99 @@ export default function Home() {
     });
   }
 
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
+  // Optimistically updates the local transcript, then persists just this
+  // word to disk — the PATCH only ever touches `word`, never start/end, so
+  // this can't drift the timing baked in at transcription time.
+  function handleWordEdit(segmentIndex: number, wordIndex: number, newText: string) {
+    setSegments((prev) => {
+      if (!prev) return prev;
+      return prev.map((segment, si) => {
+        if (si !== segmentIndex) return segment;
+        return {
+          ...segment,
+          words: segment.words.map((word, wi) => (wi === wordIndex ? { ...word, word: newText } : word)),
+        };
+      });
+    });
+
+    if (!projectId) return;
+    setSaveError(null);
+    fetch(`/api/project/${projectId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ segmentIndex, wordIndex, newText }),
+    })
+      .then((res) => {
+        if (!res.ok) setSaveError('Failed to save that edit. Your other edits are still fine.');
+      })
+      .catch(() => setSaveError('Failed to save that edit. Your other edits are still fine.'));
+  }
+
+  async function runTranscribe() {
+    if (!videoFile || videoDuration === null) {
+      setError('Select a video file first');
+      setStage('error');
+      return;
+    }
+    setError(null);
+    setUploadProgress(0);
+    setStage('uploading');
+
+    const formData = new FormData();
+    formData.append('video', videoFile);
+
+    try {
+      const data = await uploadAndTranscribe(
+        formData,
+        setUploadProgress,
+        () => setStage((s) => (s === 'uploading' ? 'transcribing' : s))
+      );
+
+      if (data.status !== 'success' || !data.projectId || !data.project) {
+        setError(data.error ?? 'Something went wrong');
+        setStage('error');
+        return;
+      }
+
+      setProjectId(data.projectId);
+      setSegments(data.project.segments);
+      setStage('editing');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Something went wrong');
+      setStage('error');
+    }
+  }
+
+  async function runRender() {
+    if (!projectId) {
+      setError('Transcribe a video first');
+      setStage('error');
+      return;
+    }
     if (selectedRatios.size === 0) {
-      setError('Select at least one output ratio');
+      setError('Select at least one output format');
+      setStage('error');
       return;
     }
     setError(null);
     setVideos(null);
-    setStage('downloading');
-
-    // The API resolves in one shot, so these timers just approximate progress
-    // through its known steps (download -> transcribe -> generate) for the UI.
-    const toTranscribing = setTimeout(() => setStage('transcribing'), 2000);
-    const toGenerating = setTimeout(() => setStage('generating'), 6000);
+    setStage('rendering');
 
     try {
-      const res = await fetch('/api/process', {
+      const res = await fetch('/api/render', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, subtitleColor, subtitleSize, aspectRatios: Array.from(selectedRatios) }),
+        body: JSON.stringify({ projectId, style, aspectRatios: Array.from(selectedRatios) }),
       });
-      const data = await res.json();
 
-      if (!res.ok || data.status !== 'success') {
+      let data: RenderResponse;
+      try {
+        data = (await res.json()) as RenderResponse;
+      } catch {
+        throw new Error('Server returned an invalid response');
+      }
+
+      if (!res.ok || data.status !== 'success' || !data.videos) {
         setError(data.error ?? 'Something went wrong');
         setStage('error');
         return;
@@ -84,126 +246,109 @@ export default function Home() {
 
       setVideos(data.videos);
       setStage('done');
+      setView('results');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Something went wrong');
       setStage('error');
-    } finally {
-      clearTimeout(toTranscribing);
-      clearTimeout(toGenerating);
     }
   }
 
+  function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!projectId) {
+      runTranscribe();
+    } else {
+      runRender();
+    }
+  }
+
+  const canSubmit = projectId
+    ? selectedRatios.size > 0
+    : selectedRatios.size > 0 && videoFile !== null && videoDuration !== null && !fileError;
+
   return (
-    <div className="flex min-h-screen flex-col items-center bg-zinc-50 px-4 py-16 dark:bg-black">
-      <div className="w-full max-w-md">
-        <h1 className="mb-8 text-2xl font-semibold text-black dark:text-zinc-50">
-          SubMix
-        </h1>
+    <div className="min-h-screen bg-base text-primary">
+      <SiteHeader />
 
-        <form onSubmit={handleSubmit} className="flex flex-col gap-4">
-          <div>
-            <label htmlFor="url" className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">
-              YouTube URL
-            </label>
-            <input
-              id="url"
-              type="url"
-              required
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-              placeholder="https://www.youtube.com/watch?v=..."
-              className="w-full rounded-md border border-zinc-300 bg-white px-3 py-2 text-black focus:outline-none focus:ring-2 focus:ring-black dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-50 dark:focus:ring-zinc-50"
-            />
-          </div>
+      <main className="mx-auto max-w-[1400px] px-8 pb-24 pt-32">
+        {view === 'results' && videos ? (
+          <ResultsView videos={videos} onBack={() => setView('edit')} />
+        ) : (
+          <>
+            <FeatureHighlights />
 
-          <div>
-            <label htmlFor="subtitleColor" className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">
-              Subtitle color
-            </label>
-            <select
-              id="subtitleColor"
-              value={subtitleColor}
-              onChange={(e) => setSubtitleColor(e.target.value as SubtitleColor)}
-              className="w-full rounded-md border border-zinc-300 bg-white px-3 py-2 text-black focus:outline-none focus:ring-2 focus:ring-black dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-50 dark:focus:ring-zinc-50"
-            >
-              {SUBTITLE_COLORS.map((color) => (
-                <option key={color} value={color}>
-                  {color[0].toUpperCase() + color.slice(1)}
-                </option>
-              ))}
-            </select>
-          </div>
+            <form onSubmit={handleSubmit} className="grid grid-cols-[45fr_55fr] items-start gap-8">
+              {/* Left column: scrollable controls */}
+              <div className="flex flex-col gap-6">
+                {projectId && videoFile ? (
+                  <div className="flex items-center justify-between border border-white/10 bg-panel px-4 py-2.5 text-sm">
+                    <span className="truncate text-primary">{videoFile.name}</span>
+                    <button
+                      type="button"
+                      onClick={resetUpload}
+                      disabled={isLoading}
+                      className="ml-3 shrink-0 font-mono text-xs uppercase text-green underline transition-colors hover:text-green/80 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      Change video
+                    </button>
+                  </div>
+                ) : (
+                  <div className={PANEL}>
+                    <span className={SECTION_LABEL}>Upload a video</span>
+                    <UploadZone
+                      file={videoFile}
+                      duration={videoDuration}
+                      error={fileError}
+                      disabled={isLoading}
+                      onSelect={(file, duration) => {
+                        setVideoFile(file);
+                        setVideoDuration(duration);
+                        setFileError(null);
+                      }}
+                      onError={(message) => {
+                        setFileError(message);
+                        setVideoFile(null);
+                        setVideoDuration(null);
+                      }}
+                      onClear={resetUpload}
+                    />
+                  </div>
+                )}
 
-          <div>
-            <label htmlFor="subtitleSize" className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">
-              Subtitle size: {subtitleSize}
-            </label>
-            <input
-              id="subtitleSize"
-              type="range"
-              min={MIN_SUBTITLE_SIZE}
-              max={MAX_SUBTITLE_SIZE}
-              value={subtitleSize}
-              onChange={(e) => setSubtitleSize(Number(e.target.value))}
-              className="w-full"
-            />
-          </div>
+                <CaptionStyleSection style={style} onStyleChange={updateStyle} />
 
-          <div>
-            <span className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">
-              Output ratios
-            </span>
-            <div className="flex flex-col gap-2">
-              {RATIOS.map(({ key, label, sublabel }) => (
-                <label key={key} className="flex items-center gap-2 text-sm text-zinc-700 dark:text-zinc-300">
-                  <input
-                    type="checkbox"
-                    checked={selectedRatios.has(key)}
-                    onChange={() => toggleRatio(key)}
-                    className="h-4 w-4 rounded border-zinc-300 text-black focus:ring-black dark:border-zinc-700 dark:text-zinc-50 dark:focus:ring-zinc-50"
-                  />
-                  <span>
-                    {label} <span className="text-zinc-500 dark:text-zinc-500">- {sublabel}</span>
-                  </span>
-                </label>
-              ))}
-            </div>
-          </div>
+                <FormatsSection selectedRatios={selectedRatios} onToggle={toggleRatio} />
 
-          <button
-            type="submit"
-            disabled={isLoading || selectedRatios.size === 0}
-            className="mt-2 rounded-md bg-black px-4 py-2 font-medium text-white transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-zinc-50 dark:text-black dark:hover:bg-zinc-200"
-          >
-            {isLoading ? STAGE_LABELS[stage] : 'Generate'}
-          </button>
-        </form>
+                {/* Action area: Transcribe button is replaced in place by the caption
+                    editor + Render button once transcription completes; on success the
+                    whole view swaps to the dedicated results screen. */}
+                {segments && (
+                  <div>
+                    <CaptionEditor segments={segments} onWordEdit={handleWordEdit} disabled={stage === 'rendering'} />
+                    {saveError && <p className="mt-2 text-sm text-red">{saveError}</p>}
+                  </div>
+                )}
 
-        {error && (
-          <p className="mt-4 text-sm text-red-600 dark:text-red-400">{error}</p>
+                <GenerateAction
+                  stage={stage}
+                  steps={projectId ? RENDER_STEPS : TRANSCRIBE_STEPS}
+                  submitLabel={projectId ? 'Render' : 'Transcribe'}
+                  error={error}
+                  isLoading={isLoading}
+                  canSubmit={canSubmit}
+                  uploadProgress={uploadProgress}
+                  onRetry={() => (projectId ? runRender() : runTranscribe())}
+                />
+              </div>
+
+              {/* Right column: sticky live preview */}
+              <div className="sticky top-32">
+                <PreviewPanel style={style} videoFile={videoFile} segments={segments} />
+              </div>
+            </form>
+          </>
         )}
-
-        {stage === 'done' && videos && (
-          <div className="mt-8">
-            <h2 className="mb-2 text-lg font-medium text-black dark:text-zinc-50">
-              Your videos
-            </h2>
-            <ul className="flex flex-col gap-2">
-              {RATIOS.filter(({ key }) => videos[key]).map(({ key, label }) => (
-                <li key={key}>
-                  <a
-                    href={videos[key]}
-                    download
-                    className="text-sm font-medium text-black underline dark:text-zinc-50"
-                  >
-                    Download {label}
-                  </a>
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-      </div>
+      </main>
     </div>
   );
 }

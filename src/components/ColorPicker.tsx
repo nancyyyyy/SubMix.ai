@@ -63,7 +63,7 @@ export function ColorPicker({ id, label, value, presets, onChange }: ColorPicker
           className="w-full border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm text-primary transition-colors hover:border-white/20 focus:border-green focus:outline-none focus:ring-1 focus:ring-green"
         />
       </div>
-      <div className="mt-2 flex gap-2">
+      <div className="mt-2 flex gap-2.5">
         {presets.map((preset) => {
           const selected = preset.toLowerCase() === value.toLowerCase();
           return (
@@ -73,7 +73,7 @@ export function ColorPicker({ id, label, value, presets, onChange }: ColorPicker
               aria-label={`Use ${preset}`}
               aria-pressed={selected}
               onClick={() => onChange(preset)}
-              className={`h-6 w-6 shrink-0 rounded-full border transition-transform hover:scale-110 ${
+              className={`h-7 w-7 shrink-0 rounded-full border transition-transform hover:scale-110 ${
                 selected ? 'border-green ring-1 ring-green' : 'border-white/20'
               }`}
               style={{ backgroundColor: preset }}

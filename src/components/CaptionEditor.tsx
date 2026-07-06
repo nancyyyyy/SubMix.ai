@@ -36,7 +36,7 @@ export function CaptionEditor({ segments, onWordEdit, disabled }: CaptionEditorP
                   value={word.word}
                   onChange={(e) => onWordEdit(si, wi, e.target.value)}
                   disabled={disabled}
-                  className="w-full border border-white/10 bg-base px-2 py-1 text-sm text-primary focus:border-green focus:outline-none disabled:cursor-not-allowed disabled:opacity-40"
+                  className="w-full min-w-0 border border-white/10 bg-base px-2 py-1.5 text-sm text-primary focus:border-green focus:outline-none disabled:cursor-not-allowed disabled:opacity-40"
                 />
               </div>
             ))}

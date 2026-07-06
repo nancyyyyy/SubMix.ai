@@ -97,7 +97,7 @@ export const WAVEFORM_HEIGHTS = [
 ];
 
 // Shared style tokens
-export const PANEL = 'border border-white/10 bg-panel p-6 shadow-[0_8px_24px_rgba(0,0,0,0.35)]';
+export const PANEL = 'border border-white/10 bg-panel p-4 shadow-[0_8px_24px_rgba(0,0,0,0.35)] sm:p-6';
 export const SECTION_LABEL = 'mb-5 font-display text-xl font-semibold uppercase tracking-tight text-primary';
 export const FIELD_LABEL = 'mb-2 block text-sm text-muted';
 export const BUTTON_PRIMARY =

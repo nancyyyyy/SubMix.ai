@@ -7,7 +7,7 @@ const FEATURES = [
 
 export function FeatureHighlights() {
   return (
-    <div className="mb-8 grid grid-cols-2 gap-3 lg:grid-cols-4">
+    <div className="mb-8 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
       {FEATURES.map(({ title, description }) => (
         <div key={title} className="border border-white/10 bg-panel px-4 py-3">
           <p className="font-display text-sm font-semibold uppercase leading-tight tracking-tight text-primary">

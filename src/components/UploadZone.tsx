@@ -119,7 +119,7 @@ export function UploadZone({ file, duration, error, onSelect, onError, onClear, 
             inputRef.current?.click();
           }
         }}
-        className={`flex flex-col items-center justify-center gap-3 border border-dashed p-8 text-center transition-colors ${
+        className={`flex flex-col items-center justify-center gap-3 border border-dashed p-6 text-center transition-colors sm:p-8 ${
           disabled
             ? 'cursor-not-allowed border-white/10 opacity-50'
             : `cursor-pointer ${isDragging ? 'border-green bg-green/5' : 'border-white/15 hover:border-white/30'}`

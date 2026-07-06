@@ -84,7 +84,7 @@ export function CaptionStyleSection({ style, onStyleChange }: CaptionStyleSectio
                 key={value}
                 type="button"
                 onClick={() => onStyleChange({ position: value })}
-                className={`border px-3 py-2 text-center text-sm transition-colors ${
+                className={`border px-3 py-2.5 text-center text-sm transition-colors ${
                   selected ? 'border-green bg-green/5 text-green' : 'border-white/10 text-muted hover:border-white/20'
                 }`}
               >

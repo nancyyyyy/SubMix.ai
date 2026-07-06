@@ -270,16 +270,16 @@ export default function Home() {
     <div className="min-h-screen bg-base text-primary">
       <SiteHeader />
 
-      <main className="mx-auto max-w-[1400px] px-8 pb-24 pt-32">
+      <main className="mx-auto max-w-[1400px] px-4 pb-12 pt-6 md:px-8 md:pb-24 md:pt-8">
         {view === 'results' && videos ? (
           <ResultsView videos={videos} onBack={() => setView('edit')} />
         ) : (
           <>
             <FeatureHighlights />
 
-            <form onSubmit={handleSubmit} className="grid grid-cols-[45fr_55fr] items-start gap-8">
-              {/* Left column: scrollable controls */}
-              <div className="flex flex-col gap-6">
+            <form onSubmit={handleSubmit} className="grid grid-cols-1 items-start gap-8 md:grid-cols-[45fr_55fr]">
+              {/* Left column: scrollable controls (shown after the preview on mobile) */}
+              <div className="order-2 flex flex-col gap-6 md:order-1">
                 {projectId && videoFile ? (
                   <div className="flex items-center justify-between border border-white/10 bg-panel px-4 py-2.5 text-sm">
                     <span className="truncate text-primary">{videoFile.name}</span>
@@ -341,8 +341,8 @@ export default function Home() {
                 />
               </div>
 
-              {/* Right column: sticky live preview */}
-              <div className="sticky top-32">
+              {/* Right column: sticky live preview (shown right after the feature cards on mobile) */}
+              <div className="order-1 md:sticky md:order-2 md:top-32">
                 <PreviewPanel style={style} videoFile={videoFile} segments={segments} />
               </div>
             </form>

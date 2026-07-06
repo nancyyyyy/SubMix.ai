@@ -4,6 +4,7 @@ import path from 'path';
 import crypto from 'crypto';
 import ffmpeg from 'fluent-ffmpeg';
 import ffmpegStaticPath from 'ffmpeg-static';
+import type { ChildProcess } from 'child_process';
 import { DEFAULT_STYLE } from './project';
 import type { AspectRatio, CaptionSegment, CaptionWord, FontChoice, StyleSettings } from './project';
 
@@ -352,23 +353,76 @@ function buildAssFilter(assPath: string, fontsDir: string): string {
 
 function runFfmpeg(inputPath: string, outputPath: string, filters: string[], variantName: string): Promise<void> {
   return new Promise((resolve, reject) => {
+    // fluent-ffmpeg's 'error' event hands back a generic Error (e.g. "ffmpeg
+    // was killed with signal SIGKILL") plus a ring-buffer-truncated stderr --
+    // enough to know *that* it died, not always enough to tell an OOM-kill
+    // apart from a codec/filter crash from the log tail alone. stderrBuffer
+    // below accumulates every line with no truncation, and childProc (read
+    // off the command instance's undocumented `ffmpegProc` property, the
+    // only way to reach the raw handle) gives access to the real exit
+    // code/signal.
+    //
+    // childProc.exitCode/.signalCode are read directly off the ChildProcess
+    // rather than captured via our own 'exit'/'close' listeners below,
+    // because fluent-ffmpeg registers its own 'exit' listener on the same
+    // process first (to translate it into the 'error' event) -- so by the
+    // time *our* 'exit' listener would run, the 'error' event (and any
+    // reject() it triggers) may already have fired. Node sets these two
+    // properties synchronously before emitting 'exit' at all, so reading
+    // them is immune to listener registration order.
+    let stderrBuffer = '';
+    let childProc: ChildProcess | null = null;
+
     ffmpeg(inputPath)
       .videoFilters(filters)
       .videoCodec('libx264')
       .audioCodec('aac')
       .outputOptions(['-preset veryfast', '-movflags +faststart'])
+      .on('start', function (this: ffmpeg.FfmpegCommand, commandLine: string) {
+        console.log(`[render:${variantName}] ffmpeg command: ${commandLine}`);
+
+        childProc = (this as unknown as { ffmpegProc?: ChildProcess }).ffmpegProc ?? null;
+        if (!childProc) {
+          console.warn(`[render:${variantName}] no ffmpegProc handle available; exit code/signal won't be logged`);
+          return;
+        }
+
+        // Logged here -- before the 'error' handler below rejects -- so it
+        // reaches Railway's deploy logs even if the rejection is swallowed
+        // or summarized upstream.
+        childProc.on('exit', (code, signal) => {
+          console.log(
+            `[render:${variantName}] child process 'exit': code=${code ?? 'null'} signal=${signal ?? 'null'}`
+          );
+        });
+
+        childProc.on('close', (code, signal) => {
+          console.log(
+            `[render:${variantName}] child process 'close': code=${code ?? 'null'} signal=${signal ?? 'null'}`
+          );
+          console.log(
+            `[render:${variantName}] full accumulated stderr (${stderrBuffer.length} bytes):\n${stderrBuffer}`
+          );
+        });
+      })
+      .on('stderr', (line: string) => {
+        stderrBuffer += line + '\n';
+      })
       .on('error', (err, _stdout, stderr) => {
-        // fluent-ffmpeg's own err.message is just the exit code plus the last
-        // stderr line (often the generic "Conversion failed!"), which hides
-        // the actual ffmpeg/libx264 error. stderr here is the full captured
-        // output, so surface its tail instead.
-        const detail = stderr
-          ?.split('\n')
+        const exitCode = childProc?.exitCode ?? null;
+        const exitSignal = childProc?.signalCode ?? null;
+        console.error(
+          `[render:${variantName}] rejecting: exitCode=${exitCode ?? 'null'} signal=${exitSignal ?? 'null'} message="${err.message}"`
+        );
+
+        const detail = (stderr || stderrBuffer)
+          .split('\n')
           .map((line) => line.trim())
           .filter(Boolean)
           .slice(-5)
           .join(' | ');
-        reject(new RenderError(`FFmpeg failed for ${variantName}: ${detail || err.message}`, 500));
+        const cause = exitSignal ? `killed by signal ${exitSignal}` : exitCode !== null ? `exited with code ${exitCode}` : err.message;
+        reject(new RenderError(`FFmpeg failed for ${variantName} (${cause}): ${detail || err.message}`, 500));
       })
       .on('end', () => resolve())
       .save(outputPath);
